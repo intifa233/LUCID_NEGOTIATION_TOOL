@@ -12,9 +12,160 @@ import json
 import os      # Used for accessing environment variables (API keys, config)
 import requests # Used for making HTTP requests to the OpenAI API
 import html
+import re      # For regex-based offer extraction
 
 # Initialize the Flask application
 app = Flask(__name__)
+
+# --- Offer Extraction Functions ---
+
+def _extract_offers_rule_based(message, role='user'):
+    """
+    Fallback rule-based offer extraction using keyword detection and regex.
+    Used when AI-based extraction fails or is unavailable.
+    """
+    offer_keywords = ['offer', 'propose', 'proposal', 'suggest', 'counter', 'bid', 'price', 'cost', 
+                      'terms', 'deal', 'rate', 'amount', 'payment', 'discount', 'willing']
+    
+    message_lower = message.lower()
+    found_keywords = [kw for kw in offer_keywords if kw in message_lower]
+    
+    # Extract numbers (prices, quantities, percentages)
+    numeric_pattern = r'\$?\d+(?:,\d{3})*(?:\.\d{2})?%?'
+    numbers = re.findall(numeric_pattern, message)
+    
+    # Extract common offer phrases
+    offer_phrases = re.findall(r'(?:offer|propose|suggest|bid|counter)[^.!?]*[.!?]', message, re.IGNORECASE)
+    
+    has_offer = len(found_keywords) > 0 or len(numbers) > 0
+    
+    return {
+        'has_offer': has_offer,
+        'role': role,
+        'raw_message': message,
+        'keywords': found_keywords,
+        'numeric_values': numbers,
+        'offer_phrases': offer_phrases[:1] if offer_phrases else [],
+        'extraction_method': 'rule_based'
+    }
+
+def extract_offers_from_message(message, role='user'):
+    """
+    Extracts negotiation offers from a message using AI analysis.
+    Falls back to rule-based extraction if AI API fails.
+    
+    Returns a dictionary with extracted offer components:
+    {
+        'has_offer': bool,
+        'raw_message': str,
+        'offer_summary': str,
+        'numeric_values': list,
+        'keywords': list,
+        'extraction_method': 'ai' or 'rule_based'
+    }
+    """
+    try:
+        # Get OpenAI API key
+        openai_api_key = (
+            os.getenv('OPENAI_API_KEY') or
+            os.getenv('openai_api_key')
+        )
+        
+        if not openai_api_key:
+            print("[INFO] OpenAI API key not available, using rule-based extraction")
+            return _extract_offers_rule_based(message, role)
+        
+        # Call OpenAI to extract offers
+        openai_url = 'https://api.openai.com/v1/chat/completions'
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {openai_api_key}'
+        }
+        
+        # System prompt to instruct LLM on offer extraction
+        system_prompt = """You are an expert negotiation analyst. Extract and summarize any negotiation offers, proposals, bids, or counter-offers from the given message.
+
+Respond in JSON format with:
+{
+    "has_offer": true/false,
+    "offer_summary": "brief summary of the offer or empty string",
+    "numeric_values": ["$500", "20%", etc],
+    "keywords": ["offer", "propose", "price", etc],
+    "negotiation_elements": ["any special terms, conditions, or constraints mentioned"]
+}
+
+Focus on understanding the intent and meaning, not just keyword matching. Consider implicit offers and nuanced language."""
+        
+        payload = {
+            'model': 'gpt-4o-mini',  # Use a faster model for quick extraction
+            'messages': [
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': message}
+            ],
+            'temperature': 0.3,  # Lower temp for more consistent extraction
+            'max_tokens': 500
+        }
+        
+        response_openai = requests.post(openai_url, headers=headers, json=payload, timeout=10)
+        
+        if response_openai.status_code == 200:
+            resp_json = response_openai.json()
+            response_text = resp_json['choices'][0]['message']['content']
+            
+            # Parse the JSON response from the AI
+            extracted_data = json.loads(response_text)
+            
+            # Ensure all expected fields are present
+            result = {
+                'has_offer': extracted_data.get('has_offer', False),
+                'role': role,
+                'raw_message': message,
+                'offer_summary': extracted_data.get('offer_summary', ''),
+                'numeric_values': extracted_data.get('numeric_values', []),
+                'keywords': extracted_data.get('keywords', []),
+                'offer_phrases': [extracted_data.get('offer_summary', '')] if extracted_data.get('offer_summary') else [],
+                'extraction_method': 'ai'
+            }
+            
+            return result
+        else:
+            # If API call fails, fall back to rule-based
+            print(f"[INFO] OpenAI API error ({response_openai.status_code}), using rule-based extraction")
+            return _extract_offers_rule_based(message, role)
+            
+    except (json.JSONDecodeError, KeyError, requests.exceptions.RequestException, Exception) as e:
+        # Any error → fall back to rule-based
+        print(f"[INFO] Error in AI extraction ({type(e).__name__}), falling back to rule-based: {e}")
+        return _extract_offers_rule_based(message, role)
+
+def get_latest_offers(conversation_history):
+    """
+    Analyzes conversation history to extract the latest offers from both user and assistant.
+    Returns a structured summary of the most recent offers from each side.
+    """
+    user_offers = []
+    assistant_offers = []
+    
+    for msg in conversation_history:
+        if msg.get('role') == 'user':
+            offer_data = extract_offers_from_message(msg.get('content', ''), 'user')
+            if offer_data['has_offer']:
+                user_offers.append(offer_data)
+        elif msg.get('role') == 'assistant':
+            offer_data = extract_offers_from_message(msg.get('content', ''), 'assistant')
+            if offer_data['has_offer']:
+                assistant_offers.append(offer_data)
+    
+    # Get the latest offer from each side
+    latest_user_offer = user_offers[-1] if user_offers else None
+    latest_assistant_offer = assistant_offers[-1] if assistant_offers else None
+    
+    return {
+        'user_latest_offer': latest_user_offer,
+        'assistant_latest_offer': latest_assistant_offer,
+        'user_offer_count': len(user_offers),
+        'assistant_offer_count': len(assistant_offers),
+    }
 
 # --- Configuration & CORS ---
 
@@ -354,10 +505,14 @@ def lucid():
                         # Extract the generated text content safely
                         generated_text = resp_json['choices'][0]['message']['content']
 
+                        # Extract offers from the conversation (NEGOTIATION FEATURE)
+                        offers_data = get_latest_offers(messages)
+
                         # Prepare the successful response data for Qualtrics frontend
                         response_data = {
                             'generated_text': generated_text,
-                            'used_temperature': used_temperature # Echo back parameters used
+                            'used_temperature': used_temperature, # Echo back parameters used
+                            'offers': offers_data  # Include extracted offer data
                         }
                         if used_seed is not None:
                             response_data['used_seed'] = used_seed # Echo back seed if used
