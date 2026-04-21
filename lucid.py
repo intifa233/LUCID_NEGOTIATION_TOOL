@@ -505,8 +505,10 @@ def lucid():
                         # Extract the generated text content safely
                         generated_text = resp_json['choices'][0]['message']['content']
 
-                        # Extract offers from the conversation (NEGOTIATION FEATURE)
-                        offers_data = get_latest_offers(messages)
+                        # Extract offers from the conversation INCLUDING the new AI response (NEGOTIATION FEATURE)
+                        # This ensures offers from the AI's latest response are immediately visible
+                        messages_with_ai_response = messages + [{'role': 'assistant', 'content': generated_text}]
+                        offers_data = get_latest_offers(messages_with_ai_response)
 
                         # Prepare the successful response data for Qualtrics frontend
                         response_data = {
