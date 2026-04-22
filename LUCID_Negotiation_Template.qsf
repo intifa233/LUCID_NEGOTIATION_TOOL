@@ -153,6 +153,38 @@
                     "VariableType": "String",
                     "DataVisibility": [],
                     "AnalyzeText": false
+                  },
+                  {
+                    "Description": "LUCID_User_Offers_List",
+                    "Type": "Recipient",
+                    "Field": "LUCID_User_Offers_List",
+                    "VariableType": "String",
+                    "DataVisibility": [],
+                    "AnalyzeText": false
+                  },
+                  {
+                    "Description": "LUCID_AI_Offers_List",
+                    "Type": "Recipient",
+                    "Field": "LUCID_AI_Offers_List",
+                    "VariableType": "String",
+                    "DataVisibility": [],
+                    "AnalyzeText": false
+                  },
+                  {
+                    "Description": "LUCID_User_Offer_Count",
+                    "Type": "Recipient",
+                    "Field": "LUCID_User_Offer_Count",
+                    "VariableType": "String",
+                    "DataVisibility": [],
+                    "AnalyzeText": false
+                  },
+                  {
+                    "Description": "LUCID_AI_Offer_Count",
+                    "Type": "Recipient",
+                    "Field": "LUCID_AI_Offer_Count",
+                    "VariableType": "String",
+                    "DataVisibility": [],
+                    "AnalyzeText": false
                   }
                 ]
               }
