@@ -38,12 +38,18 @@ def _extract_offers_rule_based(message, role='user'):
     offer_phrases = re.findall(r'(?:offer|propose|suggest|bid|counter)[^.!?]*[.!?]', message, re.IGNORECASE)
     
     has_offer = len(found_keywords) > 0 or len(numbers) > 0
-    
+
+    # Best-effort single absolute offer value: the last number mentioned is
+    # usually the figure actually being proposed (earlier numbers in a
+    # message tend to be background context, e.g. an original purchase price).
+    offer_value = numbers[-1] if numbers else ''
+
     return {
         'has_offer': has_offer,
         'role': role,
         'raw_message': message,
         'keywords': found_keywords,
+        'offer_value': offer_value,
         'numeric_values': numbers,
         'offer_phrases': offer_phrases[:1] if offer_phrases else [],
         'extraction_method': 'rule_based'
@@ -59,6 +65,7 @@ def extract_offers_from_message(message, role='user'):
         'has_offer': bool,
         'raw_message': str,
         'offer_summary': str,
+        'offer_value': str,   # single absolute value of the offer being proposed, e.g. "$450"
         'numeric_values': list,
         'keywords': list,
         'extraction_method': 'ai' or 'rule_based'
@@ -89,6 +96,7 @@ Respond in JSON format with:
 {
     "has_offer": true/false,
     "offer_summary": "brief summary of the offer or empty string",
+    "offer_value": "the single absolute value of the offer/counter-offer being proposed in THIS message, formatted like '$450' or '20%'. Use ONLY the amount actually being offered/proposed/countered right now — ignore incidental numbers that are just background context (e.g. an original purchase price, a past cost, a quantity). Empty string if no concrete offer amount is being proposed.",
     "numeric_values": ["$500", "20%", etc],
     "keywords": ["offer", "propose", "price", etc],
     "negotiation_elements": ["any special terms, conditions, or constraints mentioned"]
@@ -121,6 +129,7 @@ Focus on understanding the intent and meaning, not just keyword matching. Consid
                 'role': role,
                 'raw_message': message,
                 'offer_summary': extracted_data.get('offer_summary', ''),
+                'offer_value': extracted_data.get('offer_value', ''),
                 'numeric_values': extracted_data.get('numeric_values', []),
                 'keywords': extracted_data.get('keywords', []),
                 'offer_phrases': [extracted_data.get('offer_summary', '')] if extracted_data.get('offer_summary') else [],
