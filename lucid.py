@@ -12,169 +12,98 @@ import json
 import os      # Used for accessing environment variables (API keys, config)
 import requests # Used for making HTTP requests to the OpenAI API
 import html
-import re      # For regex-based offer extraction
 
 # Initialize the Flask application
 app = Flask(__name__)
 
-# --- Offer Extraction Functions ---
+# --- Offer Extraction ---
 
-def _extract_offers_rule_based(message, role='user'):
+def _empty_turn_offer(role, raw_message):
+    return {'has_offer': False, 'role': role, 'raw_message': raw_message or '', 'offer_value': ''}
+
+def get_turn_offers(user_message, assistant_message):
     """
-    Fallback rule-based offer extraction using keyword detection and regex.
-    Used when AI-based extraction fails or is unavailable.
+    Extracts offers for THIS negotiation turn ONLY, in a single OpenAI call
+    that looks at the user message which triggered this request and the
+    assistant's brand-new response together. No rule-based fallback and no
+    per-side call - one LLM call, one JSON result covering both sides.
+
+    Deliberately ignores the rest of the conversation history, so a round
+    where nobody restates a price doesn't "inherit" a stale offer value from
+    somewhere earlier in the chat - that side just comes back with
+    has_offer=False (and the frontend records 'None' for that turn).
     """
-    offer_keywords = ['offer', 'propose', 'proposal', 'suggest', 'counter', 'bid', 'price', 'cost', 
-                      'terms', 'deal', 'rate', 'amount', 'payment', 'discount', 'willing']
-    
-    message_lower = message.lower()
-    found_keywords = [kw for kw in offer_keywords if kw in message_lower]
-    
-    # Extract numbers (prices, quantities, percentages)
-    numeric_pattern = r'\$?\d+(?:,\d{3})*(?:\.\d{2})?%?'
-    numbers = re.findall(numeric_pattern, message)
-    
-    # Extract common offer phrases
-    offer_phrases = re.findall(r'(?:offer|propose|suggest|bid|counter)[^.!?]*[.!?]', message, re.IGNORECASE)
-    
-    has_offer = len(found_keywords) > 0 or len(numbers) > 0
+    user_message = user_message or ''
+    assistant_message = assistant_message or ''
 
-    # Best-effort single absolute offer value: the last number mentioned is
-    # usually the figure actually being proposed (earlier numbers in a
-    # message tend to be background context, e.g. an original purchase price).
-    offer_value = numbers[-1] if numbers else ''
-
-    return {
-        'has_offer': has_offer,
-        'role': role,
-        'raw_message': message,
-        'keywords': found_keywords,
-        'offer_value': offer_value,
-        'numeric_values': numbers,
-        'offer_phrases': offer_phrases[:1] if offer_phrases else [],
-        'extraction_method': 'rule_based'
+    result = {
+        'user_latest_offer': _empty_turn_offer('user', user_message),
+        'assistant_latest_offer': _empty_turn_offer('assistant', assistant_message),
     }
 
-def extract_offers_from_message(message, role='user'):
-    """
-    Extracts negotiation offers from a message using AI analysis.
-    Falls back to rule-based extraction if AI API fails.
-    
-    Returns a dictionary with extracted offer components:
-    {
-        'has_offer': bool,
-        'raw_message': str,
-        'offer_summary': str,
-        'offer_value': str,   # single absolute value of the offer being proposed, e.g. "$450"
-        'numeric_values': list,
-        'keywords': list,
-        'extraction_method': 'ai' or 'rule_based'
-    }
-    """
-    try:
-        # Get OpenAI API key
-        openai_api_key = (
-            os.getenv('OPENAI_API_KEY') or
-            os.getenv('openai_api_key')
-        )
-        
-        if not openai_api_key:
-            print("[INFO] OpenAI API key not available, using rule-based extraction")
-            return _extract_offers_rule_based(message, role)
-        
-        # Call OpenAI to extract offers
-        openai_url = 'https://api.openai.com/v1/chat/completions'
-        headers = {
-            'Content-Type': 'application/json',
-            'Authorization': f'Bearer {openai_api_key}'
-        }
-        
-        # System prompt to instruct LLM on offer extraction
-        system_prompt = """You are an expert negotiation analyst. Extract and summarize any negotiation offers, proposals, bids, or counter-offers from the given message.
+    if not user_message.strip() and not assistant_message.strip():
+        return result  # nothing said by either side this turn - skip the call entirely
+
+    openai_api_key = os.getenv('OPENAI_API_KEY') or os.getenv('openai_api_key')
+    if not openai_api_key:
+        print("[WARN] OpenAI API key not available, cannot extract offers this turn")
+        return result
+
+    system_prompt = """You are an expert negotiation analyst. You will be shown the USER's message and the ASSISTANT's message from ONE turn of a negotiation. For each of them independently, determine whether they are proposing a concrete offer/price/counter-offer IN THAT MESSAGE.
 
 Respond in JSON format with:
 {
-    "has_offer": true/false,
-    "offer_summary": "brief summary of the offer or empty string",
-    "offer_value": "the single absolute value of the offer/counter-offer being proposed in THIS message, formatted like '$450' or '20%'. Use ONLY the amount actually being offered/proposed/countered right now — ignore incidental numbers that are just background context (e.g. an original purchase price, a past cost, a quantity). Empty string if no concrete offer amount is being proposed.",
-    "numeric_values": ["$500", "20%", etc],
-    "keywords": ["offer", "propose", "price", etc],
-    "negotiation_elements": ["any special terms, conditions, or constraints mentioned"]
+    "user_offer_value": "the single absolute value the USER is proposing in THIS message, formatted like '$450' or '20%'. Use ONLY an amount actually being offered/proposed/countered right now - ignore incidental numbers used only as background context (e.g. an original purchase price, a past cost, a quantity). Empty string if the user's message contains no concrete offer.",
+    "assistant_offer_value": "the same, but for the ASSISTANT's message. Empty string if the assistant's message contains no concrete offer."
 }
 
-Focus on understanding the intent and meaning, not just keyword matching. Consider implicit offers and nuanced language."""
-        
-        payload = {
-            'model': 'gpt-4o-mini',  # Use a faster model for quick extraction
-            'messages': [
-                {'role': 'system', 'content': system_prompt},
-                {'role': 'user', 'content': message}
-            ],
-            'temperature': 0.3,  # Lower temp for more consistent extraction
-            'max_tokens': 500
-        }
-        
-        response_openai = requests.post(openai_url, headers=headers, json=payload, timeout=10)
-        
-        if response_openai.status_code == 200:
-            resp_json = response_openai.json()
-            response_text = resp_json['choices'][0]['message']['content']
-            
-            # Parse the JSON response from the AI
-            extracted_data = json.loads(response_text)
-            
-            # Ensure all expected fields are present
-            result = {
-                'has_offer': extracted_data.get('has_offer', False),
-                'role': role,
-                'raw_message': message,
-                'offer_summary': extracted_data.get('offer_summary', ''),
-                'offer_value': extracted_data.get('offer_value', ''),
-                'numeric_values': extracted_data.get('numeric_values', []),
-                'keywords': extracted_data.get('keywords', []),
-                'offer_phrases': [extracted_data.get('offer_summary', '')] if extracted_data.get('offer_summary') else [],
-                'extraction_method': 'ai'
-            }
-            
-            return result
-        else:
-            # If API call fails, fall back to rule-based
-            print(f"[INFO] OpenAI API error ({response_openai.status_code}), using rule-based extraction")
-            return _extract_offers_rule_based(message, role)
-            
-    except (json.JSONDecodeError, KeyError, requests.exceptions.RequestException, Exception) as e:
-        # Any error → fall back to rule-based
-        print(f"[INFO] Error in AI extraction ({type(e).__name__}), falling back to rule-based: {e}")
-        return _extract_offers_rule_based(message, role)
+Focus on understanding intent and meaning, not just keyword matching. Consider implicit offers and nuanced language. A message can easily contain no offer at all - don't force a value if none was really proposed."""
 
-def get_latest_offers(conversation_history):
-    """
-    Analyzes conversation history to extract the latest offers from both user and assistant.
-    Returns a structured summary of the most recent offers from each side.
-    """
-    user_offers = []
-    assistant_offers = []
-    
-    for msg in conversation_history:
-        if msg.get('role') == 'user':
-            offer_data = extract_offers_from_message(msg.get('content', ''), 'user')
-            if offer_data['has_offer']:
-                user_offers.append(offer_data)
-        elif msg.get('role') == 'assistant':
-            offer_data = extract_offers_from_message(msg.get('content', ''), 'assistant')
-            if offer_data['has_offer']:
-                assistant_offers.append(offer_data)
-    
-    # Get the latest offer from each side
-    latest_user_offer = user_offers[-1] if user_offers else None
-    latest_assistant_offer = assistant_offers[-1] if assistant_offers else None
-    
-    return {
-        'user_latest_offer': latest_user_offer,
-        'assistant_latest_offer': latest_assistant_offer,
-        'user_offer_count': len(user_offers),
-        'assistant_offer_count': len(assistant_offers),
-    }
+    turn_content = (
+        f"USER MESSAGE:\n{user_message if user_message.strip() else '(nothing said this turn)'}\n\n"
+        f"ASSISTANT MESSAGE:\n{assistant_message if assistant_message.strip() else '(nothing said this turn)'}"
+    )
+
+    try:
+        response_openai = requests.post(
+            'https://api.openai.com/v1/chat/completions',
+            headers={
+                'Content-Type': 'application/json',
+                'Authorization': f'Bearer {openai_api_key}'
+            },
+            json={
+                'model': 'gpt-4o-mini',  # fast/cheap model for a single lightweight extraction call
+                'messages': [
+                    {'role': 'system', 'content': system_prompt},
+                    {'role': 'user', 'content': turn_content}
+                ],
+                'temperature': 0.0,  # deterministic extraction
+                'max_tokens': 150,
+                'response_format': {'type': 'json_object'}
+            },
+            timeout=10
+        )
+
+        if response_openai.status_code == 200:
+            response_text = response_openai.json()['choices'][0]['message']['content']
+            extracted_data = json.loads(response_text)
+
+            user_value = (extracted_data.get('user_offer_value') or '').strip()
+            assistant_value = (extracted_data.get('assistant_offer_value') or '').strip()
+
+            result['user_latest_offer'] = {
+                'has_offer': bool(user_value), 'role': 'user', 'raw_message': user_message, 'offer_value': user_value
+            }
+            result['assistant_latest_offer'] = {
+                'has_offer': bool(assistant_value), 'role': 'assistant', 'raw_message': assistant_message, 'offer_value': assistant_value
+            }
+        else:
+            print(f"[WARN] OpenAI error extracting offers ({response_openai.status_code}): {response_openai.text}")
+
+    except (json.JSONDecodeError, KeyError, IndexError, requests.exceptions.RequestException) as e:
+        print(f"[WARN] Error extracting offers ({type(e).__name__}): {e}")
+
+    return result
 
 # --- Configuration & CORS ---
 
@@ -514,10 +443,15 @@ def lucid():
                         # Extract the generated text content safely
                         generated_text = resp_json['choices'][0]['message']['content']
 
-                        # Extract offers from the conversation INCLUDING the new AI response (NEGOTIATION FEATURE)
-                        # This ensures offers from the AI's latest response are immediately visible
-                        messages_with_ai_response = messages + [{'role': 'assistant', 'content': generated_text}]
-                        offers_data = get_latest_offers(messages_with_ai_response)
+                        # Extract offers for THIS turn only (NEGOTIATION FEATURE): the user message
+                        # that triggered this request, and the assistant's brand-new response.
+                        # We intentionally do not rescan the whole history - see get_turn_offers().
+                        latest_user_text = ''
+                        for m in reversed(messages):
+                            if m.get('role') == 'user':
+                                latest_user_text = m.get('content', '')
+                                break
+                        offers_data = get_turn_offers(latest_user_text, generated_text)
 
                         # Prepare the successful response data for Qualtrics frontend
                         response_data = {
