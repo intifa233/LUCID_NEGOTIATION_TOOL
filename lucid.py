@@ -415,10 +415,26 @@ def lucid():
                     'Content-Type': 'application/json',
                     'Authorization': f'Bearer {openai_api_key}' # Use API key for authorization
                 }
+
+                # Tell the model what round of the negotiation this is. Derived from the
+                # message history itself (count of 'user' messages, including the one that
+                # triggered this request) rather than trusting a client-supplied counter, so
+                # it can't drift out of sync. Appended as the LAST message so it's the most
+                # recent/salient context the model sees before generating - after any
+                # frontend-injected reinforcement message.
+                current_round = sum(1 for m in messages if isinstance(m, dict) and m.get('role') == 'user')
+                round_limit = body.get('round_limit')  # optional - only present if the frontend sends it
+                if round_limit:
+                    round_context = f"[SYSTEM CONTEXT: This is round {current_round} out of {round_limit} in this negotiation.]"
+                else:
+                    round_context = f"[SYSTEM CONTEXT: This is round {current_round} of this negotiation.]"
+                messages_for_api = messages + [{'role': 'system', 'content': round_context}]
+                print(f"[INFO /lucid] Injected round context: {round_context}") # Vercel Log
+
                 # Construct payload for OpenAI
                 data_payload = {
                     'model': model,
-                    'messages': messages,
+                    'messages': messages_for_api,
                     'temperature': used_temperature
                 }
                 # Only include seed if one was provided and valid
