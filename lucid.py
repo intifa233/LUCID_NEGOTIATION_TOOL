@@ -12,9 +12,35 @@ import json
 import os      # Used for accessing environment variables (API keys, config)
 import requests # Used for making HTTP requests to the OpenAI API
 import html
+import yaml    # For loading per-condition negotiation prompts from prompts.yaml
 
 # Initialize the Flask application
 app = Flask(__name__)
+
+# --- Condition Prompts (prompts.yaml) ---
+
+def _load_condition_prompts():
+    """
+    Loads prompts.yaml (the per-condition negotiation system prompts) once at cold
+    start. This lets the Prosocial/Proself prompt text be edited and redeployed
+    independently of the Qualtrics .qsf file - no re-import into Qualtrics needed,
+    and no risk of breaking anything else in the survey while editing a prompt.
+
+    Returns {} (feature silently disabled, falls back to whatever prompt the
+    frontend sends) if the file is missing or malformed, so a bad/missing YAML
+    file never takes the whole endpoint down.
+    """
+    try:
+        prompts_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prompts.yaml')
+        with open(prompts_path, encoding='utf-8') as f:
+            data = yaml.safe_load(f) or {}
+        # Normalize condition keys (e.g. "Prosocial" -> "prosocial") for case-insensitive lookup
+        return {str(k).strip().lower(): v for k, v in data.items()}
+    except Exception as e:
+        print(f"[WARN] Could not load prompts.yaml ({type(e).__name__}: {e}). Condition-based prompt override disabled.")
+        return {}
+
+CONDITION_PROMPTS = _load_condition_prompts()
 
 # --- Offer Extraction ---
 
@@ -392,6 +418,27 @@ def lucid():
                 response_data = {'error': 'Bad Request', 'message': 'Messages list is missing, empty, or invalid.'}
                 status_code = 400 # Bad Request
             else:
+                # --- Optional: override the system prompt from prompts.yaml ---
+                # If the frontend tells us which condition this participant is in (via
+                # LUCIDCondition), and prompts.yaml has an entry for it, swap in that
+                # prompt text instead of trusting whatever LUCIDPromptInitial the .qsf
+                # sent. This is what lets prompts be edited in prompts.yaml (a plain
+                # file, redeploy-only) without touching the .qsf or Qualtrics at all.
+                # Falls back to the frontend-supplied prompt if no condition is sent,
+                # the condition isn't recognized, or messages[0] isn't a system message -
+                # so nothing breaks for surveys/conditions that don't opt into this.
+                condition = body.get('condition')
+                if condition and CONDITION_PROMPTS:
+                    condition_key = str(condition).strip().lower()
+                    condition_prompt = CONDITION_PROMPTS.get(condition_key)
+                    if condition_prompt and messages[0].get('role') == 'system':
+                        messages[0] = dict(messages[0], content=condition_prompt.get('initial_prompt', messages[0].get('content')))
+                        print(f"[INFO /lucid] Using prompts.yaml system prompt for condition='{condition_key}'") # Vercel Log
+                    elif condition_prompt:
+                        print(f"[WARN /lucid] condition='{condition_key}' matched prompts.yaml but messages[0] isn't a system message; keeping frontend-supplied prompt") # Vercel Log
+                    else:
+                        print(f"[WARN /lucid] condition='{condition_key}' not found in prompts.yaml; keeping frontend-supplied prompt") # Vercel Log
+
                 # Process temperature (use value from frontend if valid, otherwise default to 1.0)
                 used_temperature = 1.0 # Default temperature
                 if temp_from_frontend is not None:
