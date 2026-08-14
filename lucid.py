@@ -418,133 +418,138 @@ def lucid():
                 response_data = {'error': 'Bad Request', 'message': 'Messages list is missing, empty, or invalid.'}
                 status_code = 400 # Bad Request
             else:
-                # --- Optional: override the system prompt from prompts.yaml ---
-                # If the frontend tells us which condition this participant is in (via
-                # LUCIDCondition), and prompts.yaml has an entry for it, swap in that
-                # prompt text instead of trusting whatever LUCIDPromptInitial the .qsf
-                # sent. This is what lets prompts be edited in prompts.yaml (a plain
-                # file, redeploy-only) without touching the .qsf or Qualtrics at all.
-                # Falls back to the frontend-supplied prompt if no condition is sent,
-                # the condition isn't recognized, or messages[0] isn't a system message -
-                # so nothing breaks for surveys/conditions that don't opt into this.
+                # --- Required: resolve the system prompt from prompts.yaml via condition ---
+                # prompts.yaml is now the single source of truth for what the AI says.
+                # LUCIDPromptInitial in the .qsf is no longer used - the frontend may still
+                # send it, but it's ignored here. This endpoint requires a recognized
+                # `condition` field with a matching prompts.yaml entry, and returns an error
+                # instead of silently falling back to a stale or missing prompt.
                 condition = body.get('condition')
-                if condition and CONDITION_PROMPTS:
-                    condition_key = str(condition).strip().lower()
-                    condition_prompt = CONDITION_PROMPTS.get(condition_key)
-                    if condition_prompt and messages[0].get('role') == 'system':
-                        messages[0] = dict(messages[0], content=condition_prompt.get('initial_prompt', messages[0].get('content')))
-                        print(f"[INFO /lucid] Using prompts.yaml system prompt for condition='{condition_key}'") # Vercel Log
-                    elif condition_prompt:
-                        print(f"[WARN /lucid] condition='{condition_key}' matched prompts.yaml but messages[0] isn't a system message; keeping frontend-supplied prompt") # Vercel Log
+                condition_key = str(condition).strip().lower() if condition else None
+                condition_prompt = CONDITION_PROMPTS.get(condition_key) if condition_key else None
+
+                if not condition_prompt:
+                    print(f"[ERROR /lucid] No prompt found for condition='{condition}'. Loaded conditions: {sorted(CONDITION_PROMPTS.keys())}") # Vercel Log
+                    response_data = {
+                        'error': 'Configuration Error',
+                        'message': f"No prompt configured for condition '{condition}'. Check that the frontend sends a valid 'condition' and that prompts.yaml has a matching entry."
+                    }
+                    status_code = 400 # Bad Request
+                else:
+                    # Use the prompts.yaml text as the system message: replace messages[0] if
+                    # it's already a system message, otherwise prepend one.
+                    if isinstance(messages[0], dict) and messages[0].get('role') == 'system':
+                        messages[0] = dict(messages[0], content=condition_prompt.get('initial_prompt', ''))
                     else:
-                        print(f"[WARN /lucid] condition='{condition_key}' not found in prompts.yaml; keeping frontend-supplied prompt") # Vercel Log
+                        messages = [{'role': 'system', 'content': condition_prompt.get('initial_prompt', '')}] + messages
+                    print(f"[INFO /lucid] Using prompts.yaml system prompt for condition='{condition_key}'") # Vercel Log
 
-                # Process temperature (use value from frontend if valid, otherwise default to 1.0)
-                used_temperature = 1.0 # Default temperature
-                if temp_from_frontend is not None:
-                    try:
-                        parsed_temp = float(temp_from_frontend)
-                        if 0.0 <= parsed_temp <= 2.0: used_temperature = parsed_temp
-                        else: print(f"[WARN /lucid] Temp '{parsed_temp}' out of range, using default.") # Vercel Log
-                    except (ValueError, TypeError): print(f"[WARN /lucid] Invalid temp format ('{temp_from_frontend}'), using default.") # Vercel Log
-                print(f"[INFO /lucid] Using temperature: {used_temperature}") # Vercel Log
+                    # Process temperature (use value from frontend if valid, otherwise default to 1.0)
+                    used_temperature = 1.0 # Default temperature
+                    if temp_from_frontend is not None:
+                        try:
+                            parsed_temp = float(temp_from_frontend)
+                            if 0.0 <= parsed_temp <= 2.0: used_temperature = parsed_temp
+                            else: print(f"[WARN /lucid] Temp '{parsed_temp}' out of range, using default.") # Vercel Log
+                        except (ValueError, TypeError): print(f"[WARN /lucid] Invalid temp format ('{temp_from_frontend}'), using default.") # Vercel Log
+                    print(f"[INFO /lucid] Using temperature: {used_temperature}") # Vercel Log
 
-                # Process seed (use value from frontend if valid, otherwise default to None)
-                used_seed = None # Default: OpenAI handles randomness
-                if seed_from_frontend is not None:
-                    try: used_seed = int(seed_from_frontend)
-                    except (ValueError, TypeError): print(f"[WARN /lucid] Invalid seed format ('{seed_from_frontend}'), using default (None).") # Vercel Log
-                print(f"[INFO /lucid] Using seed: {used_seed}") # Vercel Log
+                    # Process seed (use value from frontend if valid, otherwise default to None)
+                    used_seed = None # Default: OpenAI handles randomness
+                    if seed_from_frontend is not None:
+                        try: used_seed = int(seed_from_frontend)
+                        except (ValueError, TypeError): print(f"[WARN /lucid] Invalid seed format ('{seed_from_frontend}'), using default (None).") # Vercel Log
+                    print(f"[INFO /lucid] Using seed: {used_seed}") # Vercel Log
 
-                # --- Step 4: Call OpenAI API ---
-                openai_url = 'https://api.openai.com/v1/chat/completions'
-                headers = {
-                    'Content-Type': 'application/json',
-                    'Authorization': f'Bearer {openai_api_key}' # Use API key for authorization
-                }
+                    # --- Step 4: Call OpenAI API ---
+                    openai_url = 'https://api.openai.com/v1/chat/completions'
+                    headers = {
+                        'Content-Type': 'application/json',
+                        'Authorization': f'Bearer {openai_api_key}' # Use API key for authorization
+                    }
 
-                # Tell the model what round of the negotiation this is. Derived from the
-                # message history itself (count of 'user' messages, including the one that
-                # triggered this request) rather than trusting a client-supplied counter, so
-                # it can't drift out of sync. Appended as the LAST message so it's the most
-                # recent/salient context the model sees before generating - after any
-                # frontend-injected reinforcement message.
-                current_round = sum(1 for m in messages if isinstance(m, dict) and m.get('role') == 'user')
-                round_limit = body.get('round_limit')  # optional - only present if the frontend sends it
-                if round_limit:
-                    round_context = f"[SYSTEM CONTEXT: This is round {current_round} out of {round_limit} in this negotiation.]"
-                else:
-                    round_context = f"[SYSTEM CONTEXT: This is round {current_round} of this negotiation.]"
-                messages_for_api = messages + [{'role': 'system', 'content': round_context}]
-                print(f"[INFO /lucid] Injected round context: {round_context}") # Vercel Log
+                    # Tell the model what round of the negotiation this is. Derived from the
+                    # message history itself (count of 'user' messages, including the one that
+                    # triggered this request) rather than trusting a client-supplied counter, so
+                    # it can't drift out of sync. Appended as the LAST message so it's the most
+                    # recent/salient context the model sees before generating - after any
+                    # frontend-injected reinforcement message.
+                    current_round = sum(1 for m in messages if isinstance(m, dict) and m.get('role') == 'user')
+                    round_limit = body.get('round_limit')  # optional - only present if the frontend sends it
+                    if round_limit:
+                        round_context = f"[SYSTEM CONTEXT: This is round {current_round} out of {round_limit} in this negotiation.]"
+                    else:
+                        round_context = f"[SYSTEM CONTEXT: This is round {current_round} of this negotiation.]"
+                    messages_for_api = messages + [{'role': 'system', 'content': round_context}]
+                    print(f"[INFO /lucid] Injected round context: {round_context}") # Vercel Log
 
-                # Construct payload for OpenAI
-                data_payload = {
-                    'model': model,
-                    'messages': messages_for_api,
-                    'temperature': used_temperature
-                }
-                # Only include seed if one was provided and valid
-                if used_seed is not None:
-                    data_payload['seed'] = used_seed
+                    # Construct payload for OpenAI
+                    data_payload = {
+                        'model': model,
+                        'messages': messages_for_api,
+                        'temperature': used_temperature
+                    }
+                    # Only include seed if one was provided and valid
+                    if used_seed is not None:
+                        data_payload['seed'] = used_seed
 
-                print(f"[INFO /lucid] Calling OpenAI API (model: {model}). Payload keys: {list(data_payload.keys())}") # Vercel Log
+                    print(f"[INFO /lucid] Calling OpenAI API (model: {model}). Payload keys: {list(data_payload.keys())}") # Vercel Log
 
-                # Make the POST request to OpenAI with a timeout
-                response_openai = requests.post(openai_url, headers=headers, json=data_payload, timeout=30)
-                openai_status = response_openai.status_code
-                openai_response_text = response_openai.text # Get raw text for potential error logging
-                print(f"[INFO /lucid] OpenAI response status: {openai_status}") # Vercel Log
+                    # Make the POST request to OpenAI with a timeout
+                    response_openai = requests.post(openai_url, headers=headers, json=data_payload, timeout=30)
+                    openai_status = response_openai.status_code
+                    openai_response_text = response_openai.text # Get raw text for potential error logging
+                    print(f"[INFO /lucid] OpenAI response status: {openai_status}") # Vercel Log
 
-                # --- Step 5: Process OpenAI Response ---
-                if openai_status == 200:
-                    # Successful call
-                    print("[INFO /lucid] Successfully processed OpenAI response.") # Vercel Log
-                    try:
-                        # Parse the JSON response from OpenAI
-                        resp_json = response_openai.json()
-                        # Extract the generated text content safely
-                        generated_text = resp_json['choices'][0]['message']['content']
+                    # --- Step 5: Process OpenAI Response ---
+                    if openai_status == 200:
+                        # Successful call
+                        print("[INFO /lucid] Successfully processed OpenAI response.") # Vercel Log
+                        try:
+                            # Parse the JSON response from OpenAI
+                            resp_json = response_openai.json()
+                            # Extract the generated text content safely
+                            generated_text = resp_json['choices'][0]['message']['content']
 
-                        # Extract offers for THIS turn only (NEGOTIATION FEATURE): the user message
-                        # that triggered this request, and the assistant's brand-new response.
-                        # We intentionally do not rescan the whole history - see get_turn_offers().
-                        latest_user_text = ''
-                        for m in reversed(messages):
-                            if m.get('role') == 'user':
-                                latest_user_text = m.get('content', '')
-                                break
-                        offers_data = get_turn_offers(latest_user_text, generated_text)
+                            # Extract offers for THIS turn only (NEGOTIATION FEATURE): the user message
+                            # that triggered this request, and the assistant's brand-new response.
+                            # We intentionally do not rescan the whole history - see get_turn_offers().
+                            latest_user_text = ''
+                            for m in reversed(messages):
+                                if m.get('role') == 'user':
+                                    latest_user_text = m.get('content', '')
+                                    break
+                            offers_data = get_turn_offers(latest_user_text, generated_text)
 
-                        # Prepare the successful response data for Qualtrics frontend
-                        response_data = {
-                            'generated_text': generated_text,
-                            'used_temperature': used_temperature, # Echo back parameters used
-                            'offers': offers_data  # Include extracted offer data
-                        }
-                        if used_seed is not None:
-                            response_data['used_seed'] = used_seed # Echo back seed if used
+                            # Prepare the successful response data for Qualtrics frontend
+                            response_data = {
+                                'generated_text': generated_text,
+                                'used_temperature': used_temperature, # Echo back parameters used
+                                'offers': offers_data  # Include extracted offer data
+                            }
+                            if used_seed is not None:
+                                response_data['used_seed'] = used_seed # Echo back seed if used
 
-                        status_code = 200 # OK
-                    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
-                        # Handle cases where OpenAI gives 200 but response format is unexpected
-                        print(f"[ERROR /lucid] OpenAI response format unexpected (Status 200): {openai_response_text} - Error: {e}") # Vercel Log
-                        response_data = {'error': 'Internal Server Error', 'message': 'Invalid response format from AI service.'}
-                        status_code = 500
-                else:
-                    # Handle error responses from OpenAI (non-200 status)
-                    print(f"[ERROR DIAGNOSTIC /lucid] OpenAI API Error ({openai_status}): {openai_response_text}") # Vercel Log
-                    # Try to extract a cleaner error message from OpenAI's response JSON
-                    error_details = openai_response_text
-                    try:
-                       error_json = response_openai.json()
-                       if 'error' in error_json and 'message' in error_json['error']:
-                           error_details = error_json['error']['message']
-                    except json.JSONDecodeError:
-                        pass # Use raw text if parsing fails
-                    response_data = {'error': f'AI Service Error ({openai_status})', 'message': error_details}
-                    # Use OpenAI's status code if it's a standard error, otherwise default to 500
-                    status_code = openai_status if openai_status < 600 else 500
+                            status_code = 200 # OK
+                        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
+                            # Handle cases where OpenAI gives 200 but response format is unexpected
+                            print(f"[ERROR /lucid] OpenAI response format unexpected (Status 200): {openai_response_text} - Error: {e}") # Vercel Log
+                            response_data = {'error': 'Internal Server Error', 'message': 'Invalid response format from AI service.'}
+                            status_code = 500
+                    else:
+                        # Handle error responses from OpenAI (non-200 status)
+                        print(f"[ERROR DIAGNOSTIC /lucid] OpenAI API Error ({openai_status}): {openai_response_text}") # Vercel Log
+                        # Try to extract a cleaner error message from OpenAI's response JSON
+                        error_details = openai_response_text
+                        try:
+                           error_json = response_openai.json()
+                           if 'error' in error_json and 'message' in error_json['error']:
+                               error_details = error_json['error']['message']
+                        except json.JSONDecodeError:
+                            pass # Use raw text if parsing fails
+                        response_data = {'error': f'AI Service Error ({openai_status})', 'message': error_details}
+                        # Use OpenAI's status code if it's a standard error, otherwise default to 500
+                        status_code = openai_status if openai_status < 600 else 500
 
     # --- Step 6: Handle Exceptions during Request Processing ---
     except requests.exceptions.Timeout:
