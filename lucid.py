@@ -12,124 +12,21 @@ import json
 import os      # Used for accessing environment variables (API keys, config)
 import requests # Used for making HTTP requests to the OpenAI API
 import html
-import yaml    # For loading per-condition negotiation prompts from prompts.yaml
+
+# All prompt-loading, OpenAI-calling, and offer/round-1-compliance logic lives in
+# lucid_core.py (no Flask dependency), so local_negotiation_test.py can reuse it without
+# needing Flask installed. This file is just the HTTP/CORS/routing layer on top.
+from lucid_core import (
+    CONDITION_PROMPTS,
+    PROSOCIAL_ROUND1_MAX_ATTEMPTS,
+    _call_openai_chat,
+    _call_openai_completion_text,
+    _detect_round1_compliance_llm,
+    get_turn_offers,
+)
 
 # Initialize the Flask application
 app = Flask(__name__)
-
-# --- Condition Prompts (prompts.yaml) ---
-
-def _load_condition_prompts():
-    """
-    Loads prompts.yaml (the per-condition negotiation system prompts) once at cold
-    start. This lets the Prosocial/Proself prompt text be edited and redeployed
-    independently of the Qualtrics .qsf file - no re-import into Qualtrics needed,
-    and no risk of breaking anything else in the survey while editing a prompt.
-
-    Returns {} (feature silently disabled, falls back to whatever prompt the
-    frontend sends) if the file is missing or malformed, so a bad/missing YAML
-    file never takes the whole endpoint down.
-    """
-    try:
-        prompts_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prompts.yaml')
-        with open(prompts_path, encoding='utf-8') as f:
-            data = yaml.safe_load(f) or {}
-        # Normalize condition keys (e.g. "Prosocial" -> "prosocial") for case-insensitive lookup
-        return {str(k).strip().lower(): v for k, v in data.items()}
-    except Exception as e:
-        print(f"[WARN] Could not load prompts.yaml ({type(e).__name__}: {e}). Condition-based prompt override disabled.")
-        return {}
-
-CONDITION_PROMPTS = _load_condition_prompts()
-
-# --- Offer Extraction ---
-
-def _empty_turn_offer(role, raw_message):
-    return {'has_offer': False, 'role': role, 'raw_message': raw_message or '', 'offer_value': ''}
-
-def get_turn_offers(user_message, assistant_message):
-    """
-    Extracts offers for THIS negotiation turn ONLY, in a single OpenAI call
-    that looks at the user message which triggered this request and the
-    assistant's brand-new response together. No rule-based fallback and no
-    per-side call - one LLM call, one JSON result covering both sides.
-
-    Deliberately ignores the rest of the conversation history, so a round
-    where nobody restates a price doesn't "inherit" a stale offer value from
-    somewhere earlier in the chat - that side just comes back with
-    has_offer=False (and the frontend records 'None' for that turn).
-    """
-    user_message = user_message or ''
-    assistant_message = assistant_message or ''
-
-    result = {
-        'user_latest_offer': _empty_turn_offer('user', user_message),
-        'assistant_latest_offer': _empty_turn_offer('assistant', assistant_message),
-    }
-
-    if not user_message.strip() and not assistant_message.strip():
-        return result  # nothing said by either side this turn - skip the call entirely
-
-    openai_api_key = os.getenv('OPENAI_API_KEY') or os.getenv('openai_api_key')
-    if not openai_api_key:
-        print("[WARN] OpenAI API key not available, cannot extract offers this turn")
-        return result
-
-    system_prompt = """You are an expert negotiation analyst. You will be shown the USER's message and the ASSISTANT's message from ONE turn of a negotiation. For each of them independently, determine whether they are proposing a concrete offer/price/counter-offer IN THAT MESSAGE.
-
-Respond in JSON format with:
-{
-    "user_offer_value": "the single absolute value the USER is proposing in THIS message, formatted like '$450' or '20%'. Use ONLY an amount actually being offered/proposed/countered right now - ignore incidental numbers used only as background context (e.g. an original purchase price, a past cost, a quantity). Empty string if the user's message contains no concrete offer.",
-    "assistant_offer_value": "the same, but for the ASSISTANT's message. Empty string if the assistant's message contains no concrete offer."
-}
-
-Focus on understanding intent and meaning, not just keyword matching. Consider implicit offers and nuanced language. A message can easily contain no offer at all - don't force a value if none was really proposed."""
-
-    turn_content = (
-        f"USER MESSAGE:\n{user_message if user_message.strip() else '(nothing said this turn)'}\n\n"
-        f"ASSISTANT MESSAGE:\n{assistant_message if assistant_message.strip() else '(nothing said this turn)'}"
-    )
-
-    try:
-        response_openai = requests.post(
-            'https://api.openai.com/v1/chat/completions',
-            headers={
-                'Content-Type': 'application/json',
-                'Authorization': f'Bearer {openai_api_key}'
-            },
-            json={
-                'model': 'gpt-4o-mini',  # fast/cheap model for a single lightweight extraction call
-                'messages': [
-                    {'role': 'system', 'content': system_prompt},
-                    {'role': 'user', 'content': turn_content}
-                ],
-                'temperature': 0.0,  # deterministic extraction
-                'max_tokens': 150,
-                'response_format': {'type': 'json_object'}
-            },
-            timeout=10
-        )
-
-        if response_openai.status_code == 200:
-            response_text = response_openai.json()['choices'][0]['message']['content']
-            extracted_data = json.loads(response_text)
-
-            user_value = (extracted_data.get('user_offer_value') or '').strip()
-            assistant_value = (extracted_data.get('assistant_offer_value') or '').strip()
-
-            result['user_latest_offer'] = {
-                'has_offer': bool(user_value), 'role': 'user', 'raw_message': user_message, 'offer_value': user_value
-            }
-            result['assistant_latest_offer'] = {
-                'has_offer': bool(assistant_value), 'role': 'assistant', 'raw_message': assistant_message, 'offer_value': assistant_value
-            }
-        else:
-            print(f"[WARN] OpenAI error extracting offers ({response_openai.status_code}): {response_openai.text}")
-
-    except (json.JSONDecodeError, KeyError, IndexError, requests.exceptions.RequestException) as e:
-        print(f"[WARN] Error extracting offers ({type(e).__name__}): {e}")
-
-    return result
 
 # --- Configuration & CORS ---
 
@@ -462,12 +359,6 @@ def lucid():
                     print(f"[INFO /lucid] Using seed: {used_seed}") # Vercel Log
 
                     # --- Step 4: Call OpenAI API ---
-                    openai_url = 'https://api.openai.com/v1/chat/completions'
-                    headers = {
-                        'Content-Type': 'application/json',
-                        'Authorization': f'Bearer {openai_api_key}' # Use API key for authorization
-                    }
-
                     # Tell the model what round of the negotiation this is. Derived from the
                     # message history itself (count of 'user' messages, including the one that
                     # triggered this request) rather than trusting a client-supplied counter, so
@@ -480,7 +371,29 @@ def lucid():
                         round_context = f"[SYSTEM CONTEXT: This is round {current_round} out of {round_limit} in this negotiation.]"
                     else:
                         round_context = f"[SYSTEM CONTEXT: This is round {current_round} of this negotiation.]"
-                    messages_for_api = messages + [{'role': 'system', 'content': round_context}]
+
+                    # Prosocial-only: whether the model has already had a turn to state its
+                    # opening offer AND ask about the customer's priorities together (the
+                    # [ROUND 1 - INFORMATION EXCHANGE] step). There's no server-side session
+                    # state across requests, so this is derived from the message history
+                    # itself: if an assistant reply already exists, round 1 already happened
+                    # (and was enforced compliant - see the retry loop below), so remind the
+                    # model not to repeat the question. If not, this is round 1 and the retry
+                    # loop after the API call will enforce that THIS reply covers both.
+                    has_prior_assistant_reply = any(isinstance(m, dict) and m.get('role') == 'assistant' for m in messages)
+                    extra_system_notes = []
+                    if condition_key == 'prosocial' and has_prior_assistant_reply:
+                        extra_system_notes.append(
+                            "You already stated your opening offer and asked the customer about "
+                            "their priorities together in your first message earlier in this "
+                            "negotiation - do not ask them to restate it again. Move the negotiation "
+                            "forward on the actual price instead, unless they bring up something new "
+                            "themselves."
+                        )
+
+                    messages_for_api = messages + [{'role': 'system', 'content': round_context}] + [
+                        {'role': 'system', 'content': note} for note in extra_system_notes
+                    ]
                     print(f"[INFO /lucid] Injected round context: {round_context}") # Vercel Log
 
                     # Construct payload for OpenAI
@@ -496,7 +409,7 @@ def lucid():
                     print(f"[INFO /lucid] Calling OpenAI API (model: {model}). Payload keys: {list(data_payload.keys())}") # Vercel Log
 
                     # Make the POST request to OpenAI with a timeout
-                    response_openai = requests.post(openai_url, headers=headers, json=data_payload, timeout=30)
+                    response_openai = _call_openai_chat(messages_for_api, model, used_temperature, used_seed, openai_api_key, timeout=30)
                     openai_status = response_openai.status_code
                     openai_response_text = response_openai.text # Get raw text for potential error logging
                     print(f"[INFO /lucid] OpenAI response status: {openai_status}") # Vercel Log
@@ -510,6 +423,41 @@ def lucid():
                             resp_json = response_openai.json()
                             # Extract the generated text content safely
                             generated_text = resp_json['choices'][0]['message']['content']
+
+                            # --- Prosocial round-1 compliance: this reply MUST state the opening
+                            # offer AND ask the customer about their priorities, together (see
+                            # [ROUND 1 - INFORMATION EXCHANGE] in prompts.yaml). If it's missing
+                            # either one, regenerate rather than sending a non-compliant reply to
+                            # the chat interface. Bounded by PROSOCIAL_ROUND1_MAX_ATTEMPTS to
+                            # protect against a function timeout if the model persistently won't
+                            # comply.
+                            if condition_key == 'prosocial' and not has_prior_assistant_reply:
+                                attempts = 1
+                                complied = _detect_round1_compliance_llm(generated_text, openai_api_key)
+                                while not complied and attempts < PROSOCIAL_ROUND1_MAX_ATTEMPTS:
+                                    attempts += 1
+                                    print(f"[WARN /lucid] Prosocial round-1 reply (attempt {attempts - 1}) didn't state its opening offer and ask about customer priorities together; regenerating (attempt {attempts}/{PROSOCIAL_ROUND1_MAX_ATTEMPTS}).") # Vercel Log
+                                    nudge = {
+                                        'role': 'system',
+                                        'content': (
+                                            "Your previous draft reply did not clearly state your opening offer "
+                                            "AND ask the customer what matters most to them in this sale, "
+                                            "together in the same message. Rewrite your reply so it does both, "
+                                            "per your [ROUND 1 - INFORMATION EXCHANGE] instructions, before "
+                                            "anything else."
+                                        )
+                                    }
+                                    retry_text = _call_openai_completion_text(
+                                        messages_for_api + [nudge], model, used_temperature, used_seed, openai_api_key
+                                    )
+                                    if retry_text:
+                                        generated_text = retry_text
+                                        complied = _detect_round1_compliance_llm(generated_text, openai_api_key)
+                                    else:
+                                        print("[WARN /lucid] Round-1 retry call failed; keeping previous draft.") # Vercel Log
+                                        break
+                                if not complied:
+                                    print(f"[WARN /lucid] Prosocial round-1 reply still incomplete after {attempts} attempt(s) (capped at {PROSOCIAL_ROUND1_MAX_ATTEMPTS} to avoid a function timeout); sending best available reply anyway.") # Vercel Log
 
                             # Extract offers for THIS turn only (NEGOTIATION FEATURE): the user message
                             # that triggered this request, and the assistant's brand-new response.
