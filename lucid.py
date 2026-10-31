@@ -372,17 +372,22 @@ def lucid():
                     else:
                         round_context = f"[SYSTEM CONTEXT: This is round {current_round} of this negotiation.]"
 
-                    # Prosocial-only: whether the model has already had a turn to state its
-                    # opening offer AND ask about the customer's priorities together (the
-                    # [ROUND 1 - INFORMATION EXCHANGE] step). There's no server-side session
-                    # state across requests, so this is derived from the message history
-                    # itself: if an assistant reply already exists, round 1 already happened
-                    # (and was enforced compliant - see the retry loop below), so remind the
-                    # model not to repeat the question. If not, this is round 1 and the retry
-                    # loop after the API call will enforce that THIS reply covers both.
-                    has_prior_assistant_reply = any(isinstance(m, dict) and m.get('role') == 'assistant' for m in messages)
+                    # Prosocial-only: whether this is genuinely round 1 (the turn where the model
+                    # must state its opening offer, ask about the customer's priorities, AND
+                    # disclose its own priority - the [ROUND 1 - INFORMATION EXCHANGE] step).
+                    # There's no server-side session state across requests, so this has to be
+                    # derived from the message history itself - but NOT by checking "does any
+                    # 'assistant' message already exist in the history", because the Qualtrics
+                    # frontend pushes its static canned intro greeting (LUCIDIntroMessage) into
+                    # the history as a fake 'assistant' turn before the participant ever sends
+                    # anything. That made every "first" request look like round 2+ to an
+                    # assistant-presence check, silently skipping the round-1 compliance retry
+                    # loop below on every real session. current_round (above) is immune to this,
+                    # since it only counts 'user' messages and the intro greeting is never one -
+                    # so round 1 is simply current_round == 1.
+                    is_round_1 = current_round == 1
                     extra_system_notes = []
-                    if condition_key == 'prosocial' and has_prior_assistant_reply:
+                    if condition_key == 'prosocial' and not is_round_1:
                         extra_system_notes.append(
                             "You already stated your opening offer, asked the customer about their "
                             "priorities, and shared your own priority about making sure the price "
@@ -433,7 +438,7 @@ def lucid():
                             # non-compliant reply to the chat interface. Bounded by
                             # PROSOCIAL_ROUND1_MAX_ATTEMPTS to protect against a function timeout
                             # if the model persistently won't comply.
-                            if condition_key == 'prosocial' and not has_prior_assistant_reply:
+                            if condition_key == 'prosocial' and is_round_1:
                                 attempts = 1
                                 complied = _detect_round1_compliance_llm(generated_text, openai_api_key)
                                 while not complied and attempts < PROSOCIAL_ROUND1_MAX_ATTEMPTS:
