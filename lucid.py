@@ -384,11 +384,12 @@ def lucid():
                     extra_system_notes = []
                     if condition_key == 'prosocial' and has_prior_assistant_reply:
                         extra_system_notes.append(
-                            "You already stated your opening offer and asked the customer about "
-                            "their priorities together in your first message earlier in this "
-                            "negotiation - do not ask them to restate it again. Move the negotiation "
-                            "forward on the actual price instead, unless they bring up something new "
-                            "themselves."
+                            "You already stated your opening offer, asked the customer about their "
+                            "priorities, and shared your own priority about making sure the price "
+                            "matches the laptop's actual condition, together in your first message "
+                            "earlier in this negotiation - do not repeat any of that. Move the "
+                            "negotiation forward on the actual price instead, unless they bring up "
+                            "something new themselves."
                         )
 
                     messages_for_api = messages + [{'role': 'system', 'content': round_context}] + [
@@ -425,26 +426,29 @@ def lucid():
                             generated_text = resp_json['choices'][0]['message']['content']
 
                             # --- Prosocial round-1 compliance: this reply MUST state the opening
-                            # offer AND ask the customer about their priorities, together (see
-                            # [ROUND 1 - INFORMATION EXCHANGE] in prompts.yaml). If it's missing
-                            # either one, regenerate rather than sending a non-compliant reply to
-                            # the chat interface. Bounded by PROSOCIAL_ROUND1_MAX_ATTEMPTS to
-                            # protect against a function timeout if the model persistently won't
-                            # comply.
+                            # offer, ask the customer about their priorities, AND disclose the AI's
+                            # own priority (making sure the price matches the laptop's condition),
+                            # all together (see [ROUND 1 - INFORMATION EXCHANGE] in prompts.yaml).
+                            # If any of the three is missing, regenerate rather than sending a
+                            # non-compliant reply to the chat interface. Bounded by
+                            # PROSOCIAL_ROUND1_MAX_ATTEMPTS to protect against a function timeout
+                            # if the model persistently won't comply.
                             if condition_key == 'prosocial' and not has_prior_assistant_reply:
                                 attempts = 1
                                 complied = _detect_round1_compliance_llm(generated_text, openai_api_key)
                                 while not complied and attempts < PROSOCIAL_ROUND1_MAX_ATTEMPTS:
                                     attempts += 1
-                                    print(f"[WARN /lucid] Prosocial round-1 reply (attempt {attempts - 1}) didn't state its opening offer and ask about customer priorities together; regenerating (attempt {attempts}/{PROSOCIAL_ROUND1_MAX_ATTEMPTS}).") # Vercel Log
+                                    print(f"[WARN /lucid] Prosocial round-1 reply (attempt {attempts - 1}) didn't state its opening offer, ask about customer priorities, and disclose its own priority together; regenerating (attempt {attempts}/{PROSOCIAL_ROUND1_MAX_ATTEMPTS}).") # Vercel Log
                                     nudge = {
                                         'role': 'system',
                                         'content': (
-                                            "Your previous draft reply did not clearly state your opening offer "
-                                            "AND ask the customer what matters most to them in this sale, "
-                                            "together in the same message. Rewrite your reply so it does both, "
-                                            "per your [ROUND 1 - INFORMATION EXCHANGE] instructions, before "
-                                            "anything else."
+                                            "Your previous draft reply did not clearly do all three required "
+                                            "things together in the same message: (1) state your opening "
+                                            "offer, (2) ask the customer what matters most to them in this "
+                                            "sale, and (3) share - in English - that your own priority is "
+                                            "making sure the price matches the laptop's actual condition. "
+                                            "Rewrite your reply so it does all three, per your [ROUND 1 - "
+                                            "INFORMATION EXCHANGE] instructions, before anything else."
                                         )
                                     }
                                     retry_text = _call_openai_completion_text(

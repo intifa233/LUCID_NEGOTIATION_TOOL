@@ -88,39 +88,48 @@ def _call_openai_completion_text(messages, model, temperature, seed, api_key):
 def _detect_round1_compliance_llm(assistant_reply, api_key):
     """
     Cheap classifier call: does this reply from the Prosocial laptop-buyback agent satisfy
-    BOTH requirements of its [ROUND 1 - INFORMATION EXCHANGE] instructions, TOGETHER in
+    ALL THREE requirements of its [ROUND 1 - INFORMATION EXCHANGE] instructions, TOGETHER in
     this one message?
       1. States a concrete opening price offer - a specific dollar amount it's offering.
       2. Actively asks the customer what matters most to them in the sale (highest price
          vs. a quick/easy sale vs. something else). A generic greeting or a question about
          something unrelated (e.g. the laptop's condition) does NOT count as #2.
+      3. Discloses, in English, that its own priority is making sure the price matches the
+         laptop's actual condition - a fixed, always-the-same-idea disclosure, though the
+         model phrases it in its own words each time.
 
-    Fails safe: any error, or either requirement missing, is treated as non-compliant
+    Fails safe: any error, or any requirement missing, is treated as non-compliant
     (False), so the retry loop errs toward retrying rather than silently accepting a
-    reply that's missing the offer, the question, or both.
+    reply that's missing the offer, the question, the disclosure, or any combination.
     """
     if not assistant_reply or not assistant_reply.strip():
         return False
 
-    system_prompt = """You are checking whether a message from an AI negotiator (a used-laptop buyback agent) satisfies BOTH of the following, together, in this ONE message:
+    system_prompt = """You are checking whether a message from an AI negotiator (a used-laptop buyback agent) satisfies ALL THREE of the following, together, in this ONE message:
 1. States a concrete opening price offer - a specific dollar amount it is offering for the laptop.
 2. Actively asks the customer what matters most to them in this sale - e.g. whether they most care about getting the highest possible price, a quick/easy sale, or something else. A generic greeting, or a question about something unrelated (e.g. the laptop's condition or specs), does NOT count as asking about priorities.
+3. States, in English, that ITS OWN priority is making sure the price matches the laptop's actual condition. This must be framed as something that matters to the AI itself (e.g. "my priority is...", "what matters most to me is..."), not just a restatement of the customer's claims about the laptop.
 
 Respond in JSON format with:
 {
     "states_opening_offer": true/false,
-    "asks_about_priorities": true/false
+    "asks_about_priorities": true/false,
+    "discloses_own_priority": true/false
 }"""
 
     try:
         resp = _call_openai_chat(
             [{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': assistant_reply}],
-            'gpt-4o-mini', 0.0, None, api_key, timeout=10, max_tokens=50,
+            'gpt-4o-mini', 0.0, None, api_key, timeout=10, max_tokens=80,
             response_format={'type': 'json_object'}
         )
         if resp.status_code == 200:
             data = json.loads(resp.json()['choices'][0]['message']['content'])
-            return bool(data.get('states_opening_offer')) and bool(data.get('asks_about_priorities'))
+            return (
+                bool(data.get('states_opening_offer'))
+                and bool(data.get('asks_about_priorities'))
+                and bool(data.get('discloses_own_priority'))
+            )
         print(f"[WARN /lucid] Round-1 compliance detector failed ({resp.status_code}): {resp.text[:300]}")
     except (requests.exceptions.RequestException, KeyError, IndexError, json.JSONDecodeError) as e:
         print(f"[WARN /lucid] Round-1 compliance detector error ({type(e).__name__}): {e}")

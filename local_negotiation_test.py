@@ -12,13 +12,14 @@ behave the way we designed it" - nothing here is saved anywhere.
 
 Single-issue specifics (this is the difference from the multi-issue project's version of
 this script): Prosocial's prompt has a [ROUND 1 - INFORMATION EXCHANGE] section requiring
-its very first reply to state its opening offer AND ask the customer what matters most to
-them in the sale, together in the same message. There's no per-issue hold-firm/first-
-concession logic here (that's a multi-issue concept) - just a single one-time compliance
-gate on round 1: if the model's first draft is missing the offer, the question, or both,
-this script (like lucid.py) regenerates it (up to PROSOCIAL_ROUND1_MAX_ATTEMPTS times)
-rather than ever showing you a non-compliant round-1 reply. From round 2 onward, a
-reminder note tells the model not to ask again - matching lucid.py exactly.
+its very first reply to state its opening offer, ask the customer what matters most to
+them in the sale, AND disclose its own priority (making sure the price matches the
+laptop's actual condition), all together in the same message. There's no per-issue
+hold-firm/first-concession logic here (that's a multi-issue concept) - just a single one-time compliance
+gate on round 1: if the model's first draft is missing any of the three, this script (like
+lucid.py) regenerates it (up to PROSOCIAL_ROUND1_MAX_ATTEMPTS times) rather than ever
+showing you a non-compliant round-1 reply. From round 2 onward, a reminder note tells the
+model not to repeat any of it - matching lucid.py exactly.
 
 Setup:
     1. Put your OpenAI API key in .env (already gitignored):
@@ -110,11 +111,12 @@ def main():
         extra_system_notes = []
         if condition_key == 'prosocial' and has_prior_assistant_reply:
             extra_system_notes.append(
-                "You already stated your opening offer and asked the customer about "
-                "their priorities together in your first message earlier in this "
-                "negotiation - do not ask them to restate it again. Move the "
-                "negotiation forward on the actual price instead, unless they bring "
-                "up something new themselves."
+                "You already stated your opening offer, asked the customer about "
+                "their priorities, and shared your own priority about making sure "
+                "the price matches the laptop's actual condition, together in your "
+                "first message earlier in this negotiation - do not repeat any of "
+                "that. Move the negotiation forward on the actual price instead, "
+                "unless they bring up something new themselves."
             )
 
         messages_for_api = messages + [{'role': 'system', 'content': round_context}] + [
@@ -131,22 +133,26 @@ def main():
             continue
 
         # --- Same Prosocial round-1 compliance enforcement as lucid.py's /lucid endpoint:
-        # the first reply MUST state the opening offer AND ask about the customer's
-        # priorities, together, or it never reaches you - regenerate (up to
-        # PROSOCIAL_ROUND1_MAX_ATTEMPTS times) until it does. ---
+        # the first reply MUST state the opening offer, ask about the customer's
+        # priorities, AND disclose its own priority (laptop condition), all together, or
+        # it never reaches you - regenerate (up to PROSOCIAL_ROUND1_MAX_ATTEMPTS times)
+        # until it does. ---
         if condition_key == 'prosocial' and not has_prior_assistant_reply:
             attempts = 1
             complied = lucid._detect_round1_compliance_llm(reply, api_key)
-            print(f"  [round-1 compliance check: {'offer + question both present' if complied else 'missing offer and/or question - regenerating'}]")
+            print(f"  [round-1 compliance check: {'offer + question + own-priority all present' if complied else 'missing one or more of offer/question/own-priority - regenerating'}]")
             while not complied and attempts < lucid.PROSOCIAL_ROUND1_MAX_ATTEMPTS:
                 attempts += 1
                 nudge = {
                     'role': 'system',
                     'content': (
-                        "Your previous draft reply did not clearly state your opening offer AND "
-                        "ask the customer what matters most to them in this sale, together in the "
-                        "same message. Rewrite your reply so it does both, per your "
-                        "[ROUND 1 - INFORMATION EXCHANGE] instructions, before anything else."
+                        "Your previous draft reply did not clearly do all three required "
+                        "things together in the same message: (1) state your opening offer, "
+                        "(2) ask the customer what matters most to them in this sale, and "
+                        "(3) share - in English - that your own priority is making sure the "
+                        "price matches the laptop's actual condition. Rewrite your reply so "
+                        "it does all three, per your [ROUND 1 - INFORMATION EXCHANGE] "
+                        "instructions, before anything else."
                     )
                 }
                 retry_text = lucid._call_openai_completion_text(
@@ -155,7 +161,7 @@ def main():
                 if retry_text:
                     reply = retry_text
                     complied = lucid._detect_round1_compliance_llm(reply, api_key)
-                    print(f"  [retry {attempts}/{lucid.PROSOCIAL_ROUND1_MAX_ATTEMPTS}: {'offer + question both present' if complied else 'still missing offer and/or question'}]")
+                    print(f"  [retry {attempts}/{lucid.PROSOCIAL_ROUND1_MAX_ATTEMPTS}: {'offer + question + own-priority all present' if complied else 'still missing one or more'}]")
                 else:
                     print("  [retry call failed - keeping previous draft]")
                     break

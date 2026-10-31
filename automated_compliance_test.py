@@ -4,9 +4,10 @@ Automated compliance test: runs full 10-round negotiations against a real OpenAI
 (no human typing) for both Prosocial and Proself, several instances each, and checks
 whether the AI negotiator's behavior actually followed prompts.yaml's rules:
 
-  - Round 1: states its opening offer AND asks about the customer's priorities together
-             (enforced live via lucid_core's retry loop, same as production - this test
-             just reports how many attempts it took).
+  - Round 1: states its opening offer, asks about the customer's priorities, AND discloses
+             its own priority (making sure the price matches the laptop's actual condition),
+             all together (enforced live via lucid_core's retry loop, same as production -
+             this test just reports how many attempts it took).
   - Holds its $300 anchor through round 3 (no concession before round 4).
   - Never exceeds its ceiling ($450 Prosocial / $400 Proself).
   - Offers move monotonically once it starts conceding (no random drops).
@@ -141,11 +142,12 @@ def run_negotiation(condition_key, model, temperature, max_rounds, instance_labe
         extra_notes = []
         if condition_key == 'prosocial' and has_prior_assistant_reply:
             extra_notes.append(
-                "You already stated your opening offer and asked the customer about "
-                "their priorities together in your first message earlier in this "
-                "negotiation - do not ask them to restate it again. Move the "
-                "negotiation forward on the actual price instead, unless they bring "
-                "up something new themselves."
+                "You already stated your opening offer, asked the customer about "
+                "their priorities, and shared your own priority about making sure "
+                "the price matches the laptop's actual condition, together in your "
+                "first message earlier in this negotiation - do not repeat any of "
+                "that. Move the negotiation forward on the actual price instead, "
+                "unless they bring up something new themselves."
             )
         messages_for_api = ai_messages + [{'role': 'system', 'content': round_context}] + [
             {'role': 'system', 'content': n} for n in extra_notes
@@ -166,10 +168,13 @@ def run_negotiation(condition_key, model, temperature, max_rounds, instance_labe
                 nudge = {
                     'role': 'system',
                     'content': (
-                        "Your previous draft reply did not clearly state your opening offer AND "
-                        "ask the customer what matters most to them in this sale, together in the "
-                        "same message. Rewrite your reply so it does both, per your "
-                        "[ROUND 1 - INFORMATION EXCHANGE] instructions, before anything else."
+                        "Your previous draft reply did not clearly do all three required "
+                        "things together in the same message: (1) state your opening offer, "
+                        "(2) ask the customer what matters most to them in this sale, and "
+                        "(3) share - in English - that your own priority is making sure the "
+                        "price matches the laptop's actual condition. Rewrite your reply so "
+                        "it does all three, per your [ROUND 1 - INFORMATION EXCHANGE] "
+                        "instructions, before anything else."
                     )
                 }
                 retry_text = lucid._call_openai_completion_text(
@@ -259,6 +264,9 @@ def check_compliance(result):
     elif result['round1_complied'] is None:
         checks.append(('round1_offer_and_question', None, f"inconclusive - {result['aborted_reason'] or 'round 1 never completed'}"))
     else:
+        # round1_complied now gates on all three [ROUND 1 - INFORMATION EXCHANGE]
+        # requirements together (offer, question, AND the AI's own-priority disclosure) -
+        # see lucid_core._detect_round1_compliance_llm.
         checks.append((
             'round1_offer_and_question',
             bool(result['round1_complied']),
